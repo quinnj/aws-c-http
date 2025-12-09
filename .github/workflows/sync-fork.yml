@@ -1,0 +1,203 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/awslabs/aws-c-http.git
+  PATCH_SOURCE_BRANCH: jq-websocket-upgrade-commit
+  PATCH_TARGET_BRANCH: patched-main
+
+jobs:
+  sync-branches:
+    name: Sync branches and rebuild patch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.PAT }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream --prune --tags
+          git fetch origin "$PATCH_SOURCE_BRANCH" --prune
+
+      - name: Configure Git
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+
+      - name: Sync main with upstream
+        id: sync_main
+        run: |
+          set -euo pipefail
+          git checkout main
+          git fetch upstream main
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          if [ "$LOCAL_SHA" != "$UPSTREAM_SHA" ]; then
+            git reset --hard "$UPSTREAM_SHA"
+            git push origin main --force-with-lease
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Fork main already matches upstream main"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebuild patched-main with websocket patch
+        id: rebuild_patched
+        run: |
+          set -euo pipefail
+          PATCH_BRANCH="$PATCH_TARGET_BRANCH"
+          PATCH_SOURCE="$PATCH_SOURCE_BRANCH"
+          git fetch origin "$PATCH_SOURCE"
+          git checkout -B "$PATCH_BRANCH" upstream/main
+          COMMITS=$(git log -n 2 --reverse --format=%H "origin/$PATCH_SOURCE")
+          if [ -z "$COMMITS" ]; then
+            echo "No commits found on origin/$PATCH_SOURCE to cherry-pick" >&2
+            exit 1
+          fi
+          for COMMIT in $COMMITS; do
+            git cherry-pick "$COMMIT"
+          done
+          LOCAL_PATCH_SHA=$(git rev-parse HEAD)
+          REMOTE_PATCH_SHA=$(git ls-remote --heads origin "$PATCH_BRANCH" | awk 'NR==1 {print $1}')
+          if [ -z "$REMOTE_PATCH_SHA" ]; then
+            git push origin "$PATCH_BRANCH"
+            PUSHED=true
+          elif [ "$REMOTE_PATCH_SHA" != "$LOCAL_PATCH_SHA" ]; then
+            git push origin "$PATCH_BRANCH" --force-with-lease
+            PUSHED=true
+          else
+            PUSHED=false
+          fi
+          echo "patched_updated=$PUSHED" >> "$GITHUB_OUTPUT"
+          echo "patched_sha=$LOCAL_PATCH_SHA" >> "$GITHUB_OUTPUT"
+
+  sync-releases:
+    name: Mirror upstream releases
+    runs-on: ubuntu-latest
+    needs: sync-branches
+    steps:
+      - name: Checkout patched branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: patched-main
+          token: ${{ secrets.PAT }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream --prune --tags
+          git fetch origin --prune --tags
+
+      - name: Configure Git
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+
+      - name: Determine latest upstream and fork releases
+        id: determine_tags
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+
+          def list_remote_tags(remote):
+              out = subprocess.run([
+                  "git", "ls-remote", "--tags", "--refs", remote
+              ], check=True, text=True, capture_output=True).stdout.strip().splitlines()
+              tags = []
+              for line in out:
+                  if not line.strip():
+                      continue
+                  sha, ref = line.split()
+                  tag = ref.rsplit('/', 1)[-1]
+                  key = parse_version(tag)
+                  if key is None:
+                      continue
+                  tags.append((key, tag, sha))
+              return tags
+
+          def parse_version(tag):
+              base = tag.lstrip('v')
+              if not re.fullmatch(r'\d+(?:\.\d+)*', base):
+                  return None
+              return tuple(int(part) for part in base.split('.'))
+
+          def pick_latest(tags):
+              if not tags:
+                  return None
+              return max(tags, key=lambda entry: entry[0])
+
+          upstream_latest = pick_latest(list_remote_tags('upstream'))
+          origin_latest = pick_latest(list_remote_tags('origin'))
+
+          latest_upstream_tag = upstream_latest[1] if upstream_latest else ''
+          latest_upstream_sha = upstream_latest[2] if upstream_latest else ''
+          latest_origin_tag = origin_latest[1] if origin_latest else ''
+          latest_origin_sha = origin_latest[2] if origin_latest else ''
+
+          should_release = 'false'
+          if latest_upstream_tag:
+              if not latest_origin_tag or upstream_latest[0] > origin_latest[0]:
+                  should_release = 'true'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f"latest_upstream_tag={latest_upstream_tag}\n")
+              fh.write(f"latest_upstream_sha={latest_upstream_sha}\n")
+              fh.write(f"latest_fork_tag={latest_origin_tag}\n")
+              fh.write(f"latest_fork_sha={latest_origin_sha}\n")
+              fh.write(f"should_release={should_release}\n")
+          PY
+
+      - name: Create fork release tag from patched-main
+        if: steps.determine_tags.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.determine_tags.outputs.latest_upstream_tag }}"
+          UPSTREAM_SHA="${{ steps.determine_tags.outputs.latest_upstream_sha }}"
+          git checkout "$PATCH_TARGET_BRANCH"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists locally; skipping creation."
+            exit 0
+          fi
+          git fetch upstream "refs/tags/$TAG"
+          FETCH_SHA=$(git rev-parse --verify FETCH_HEAD)
+          if [ "$FETCH_SHA" != "$UPSTREAM_SHA" ]; then
+            echo "Fetched upstream tag SHA does not match expected SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Patched branch does not contain upstream release commit $TAG" >&2
+            exit 1
+          fi
+          git tag -a "$TAG" HEAD -m "Sync upstream release $TAG plus fork custom patches"
+          git push origin "$TAG"
+
+      - name: Publish GitHub release
+        if: steps.determine_tags.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ steps.determine_tags.outputs.latest_upstream_tag }}
+          tag_name: ${{ steps.determine_tags.outputs.latest_upstream_tag }}
+          target_commitish: ${{ env.PATCH_TARGET_BRANCH }}
+          body: |
+            This is an auto-synced release that tracks upstream tag ${{ steps.determine_tags.outputs.latest_upstream_tag }} from awslabs/aws-c-http.
+
+            It includes that upstream release plus the fork's websocket upgrade patch.
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
